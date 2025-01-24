@@ -1,0 +1,2 @@
+/help: to get guide
+/quit: to quit the server
