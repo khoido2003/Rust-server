@@ -1,10 +1,13 @@
 use futures::{SinkExt, StreamExt};
 use tokio::{
     self,
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
+    sync::broadcast::{self, Sender},
 };
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
+
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::broadcast::error::RecvError;
 
 ////////////////////////////////////////////
 
@@ -13,58 +16,75 @@ const HELP_MSG: &str = include_str!("help.txt");
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let server = TcpListener::bind("127.0.0.1:42069").await?;
+    let (tx, _) = broadcast::channel::<String>(32);
 
     loop {
-        let (mut tcp, _) = server.accept().await?;
-        let (reader, writer) = tcp.split();
+        let (tcp, _) = server.accept().await?;
+        tokio::spawn(handle_user(tcp, tx.clone()));
+    }
+}
 
-        //let mut buffer = [0u8; 16];
+/////////////////////////////////////////////////////
 
-        let mut stream = FramedRead::new(reader, LinesCodec::new());
-        let mut sink = FramedWrite::new(writer, LinesCodec::new());
+async fn handle_user(mut tcp: TcpStream, tx: Sender<String>) -> anyhow::Result<()> {
+    let (reader, writer) = tcp.into_split();
+    let mut stream = FramedRead::new(reader, LinesCodec::new());
+    let mut sink = FramedWrite::new(writer, LinesCodec::new());
+    let mut rx = tx.subscribe();
 
-        //loop {
-        //    match tcp.read(&mut buffer).await {
-        //        Ok(0) => {
-        //            break;
-        //        }
-        //        Ok(n) => {
-        //            let mut line = String::from_utf8(buffer[..n].to_vec())?;
-        //
-        //            // Remove \n char
-        //            line.pop();
-        //            line.push_str("\nLove you");
-        //
-        //            if let Err(e) = tcp.write_all(line.as_bytes()).await {
-        //                eprint!("Failed to write to socket; err = {:?}", e);
-        //                break;
-        //            }
-        //        }
-        //
-        //        Err(e) => {
-        //            eprintln!("Failed to read from socket; err = {:?}", e);
-        //            break;
-        //        }
-        //    }
-        //}
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(mut msg) => {
-                    if msg.starts_with("/help") {
-                        sink.send(HELP_MSG).await?;
-                    } else if msg.starts_with("/quit") {
-                        break;
-                    } else {
-                        msg.push_str(" Love you");
-                        sink.send(msg).await?;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to read message: {:?}", e);
+    loop {
+        tokio::select! {
+            user_msg = stream.next() => {
+                if process_user_msg(user_msg, &mut sink, &tx).await? {
                     break;
                 }
-            }
+            },
+
+            peer_msg = rx.recv() => {
+               process_peer_msg(peer_msg, &mut sink).await?;
+            },
         }
     }
+    Ok(())
+}
+
+async fn process_user_msg(
+    user_msg: Option<Result<String, LinesCodecError>>,
+    sink: &mut FramedWrite<OwnedWriteHalf, LinesCodec>,
+    tx: &Sender<String>,
+) -> anyhow::Result<bool> {
+    match user_msg {
+        Some(Ok(msg)) => {
+            if msg.starts_with("/help") {
+                sink.send(HELP_MSG).await?;
+            } else if msg.starts_with("/quit") {
+                return Ok(true);
+            } else {
+                tx.send(msg)?;
+            }
+        }
+        Some(Err(err)) => {
+            return Err(err.into());
+        }
+        None => return Ok(true),
+    }
+    Ok(false)
+}
+
+async fn process_peer_msg(
+    peer_msg: Result<String, RecvError>,
+    sink: &mut FramedWrite<tokio::net::tcp::OwnedWriteHalf, LinesCodec>,
+) -> anyhow::Result<()> {
+    match peer_msg {
+        Ok(msg) => {
+            sink.send(msg).await?;
+        }
+        Err(RecvError::Lagged(_)) => {}
+
+        Err(_) => {
+            return Ok(());
+        }
+    }
+
+    Ok(())
 }
