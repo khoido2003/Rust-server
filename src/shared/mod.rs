@@ -10,3 +10,13 @@ pub fn random_name() -> String {
 
     format!("{adjective}{animal}")
 }
+
+macro_rules! b {
+    ($result:expr) => {
+        match $result {
+            Ok(ok) => ok,
+            Err(err) => return Err(err.into()),
+        }
+    };
+}
+pub(crate) use b;
